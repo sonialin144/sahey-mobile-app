@@ -12,15 +12,27 @@
       "resizeMode": "contain",
       "backgroundColor": "#ffffff"
     },
+    "plugins": [
+      [
+        "expo-contacts",
+        {
+          "contactsPermission": "Sahey uses your contacts so you can add alert recipients from your phone."
+        }
+      ]
+    ],
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "infoPlist": {
+        "NSContactsUsageDescription": "Sahey uses your contacts so you can add alert recipients from your phone."
+      }
     },
     "android": {
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",
         "backgroundColor": "#ffffff"
       },
-      "edgeToEdgeEnabled": true
+      "edgeToEdgeEnabled": true,
+      "permissions": ["android.permission.READ_CONTACTS"]
     },
     "web": {
       "favicon": "./assets/favicon.png"
