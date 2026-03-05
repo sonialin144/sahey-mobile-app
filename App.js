@@ -174,6 +174,8 @@ export default function App() {
                 <HomeScreen
                   onConnectPress={() => setDeviceView('search')}
                   isConnected={isDeviceConnected}
+                  onViewContacts={() => setCurrentTab(contacts)}
+                  contactCount={contacts.length}
                 />
               )
               : (
@@ -306,7 +308,7 @@ function formatPhoneForDisplay(raw) {
 }
 
 // --- HOME SCREEN ---
-const HomeScreen = ({ onConnectPress, isConnected }) => (
+const HomeScreen = ({ onConnectPress, isConnected, onViewContacts, contactCount }) => (
   <View style={styles.screenInner}>
     <View style={styles.headerRow}>
       <View>
@@ -346,20 +348,26 @@ const HomeScreen = ({ onConnectPress, isConnected }) => (
       </TouchableOpacity>
     </View>
 
-    <Text style={styles.sectionTitle}>Active Gestures</Text>
-    <View style={styles.gestureRow}>
-      <View style={styles.gestureBox}>
-        <MaterialCommunityIcons name="gesture-double-tap" size={24} color="#3898FC" />
-        <Text style={styles.bold}>Double Tap</Text>
-        <Text style={styles.sub}>SMS Location</Text>
+    <Text style={styles.sectionTitle}>Emergency Contacts</Text>
+    
+    <TouchableOpacity 
+      style={styles.contactConfigBox} 
+      onPress={onViewContacts} // <--- Use the new prop here
+    >
+      <View style={styles.contactLeftSection}>
+        <View style={styles.iconCircle}>
+          <MaterialCommunityIcons name="account-group" size={22} color="#3898FC" />
+        </View>
+        <Text style={styles.contactConfigText}>
+          {contactCount} {contactCount === 1 ? 'Contact' : 'Contacts'} Configured
+        </Text>
       </View>
-      <View style={styles.gestureBox}>
-        {/* Fixed icon name here */}
-        <MaterialCommunityIcons name="vibrate" size={24} color="#3898FC" />
-        <Text style={styles.bold}>Shake x3</Text>
-        <Text style={styles.sub}>Call Help</Text>
+      
+      <View style={styles.viewLinkContainer}>
+        <Text style={styles.viewLinkText}>View</Text>
+        <MaterialCommunityIcons name="chevron-right" size={20} color="#3898FC" />
       </View>
-    </View>
+    </TouchableOpacity>
   </View>
 );
 
@@ -797,5 +805,48 @@ const styles = StyleSheet.create({
   },
   btn: { padding: 18, borderRadius: 15, width: '47%', alignItems: 'center' },
   btnCancel: { backgroundColor: '#F1F3F5' },
-  btnSave: { backgroundColor: '#3898FC' }
+  btnSave: { backgroundColor: '#3898FC' },
+  // Add these to your existing styles object
+  contactConfigBox: {
+    backgroundColor: '#F8F9FA', // Matches your gestureBox and contactCard
+    padding: 18,
+    borderRadius: 20,           // Matches your gestureBox
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 12,
+  },
+  contactLeftSection: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  iconCircle: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: '#FFF',    // White circle to pop against the light grey background
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginRight: 12,
+    // Optional: add a very subtle shadow to the white circle
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.05,
+    shadowRadius: 2,
+    elevation: 1,
+  },
+  contactConfigText: {
+    fontSize: 16,
+    fontWeight: '700',          // Matches your emptyTitle/contactName weight
+    color: '#1a1a1a',
+  },
+  viewLinkContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  viewLinkText: {
+    color: '#3898FC',           // Matches your editButtonText/connectButton color
+    fontWeight: '700',
+    fontSize: 15,
+  },
 });
