@@ -24,8 +24,7 @@
       "supportsTablet": true,
       "infoPlist": {
         "NSContactsUsageDescription": "Sahey uses your contacts so you can add alert recipients from your phone."
-      },
-      "bundleIdentifier": "com.anonymous.sahey-app"
+      }
     },
     "android": {
       "adaptiveIcon": {
