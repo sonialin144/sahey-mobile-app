@@ -12,6 +12,7 @@ import {
   ActivityIndicator,
   Alert,
   Animated,
+  PermissionsAndroid,
 } from 'react-native';
 import { MaterialCommunityIcons } from '@expo/vector-icons';
 import * as Contacts from 'expo-contacts';
@@ -468,6 +469,17 @@ const ContactsScreen = ({
   </View>
 );
 
+// Short ID for BLE device (id is often UUID or MAC) so "Unknown" entries are distinguishable
+const shortDeviceId = (id) => {
+  if (!id) return '';
+  const s = String(id).trim();
+  if (s.includes(':')) {
+    const parts = s.split(':');
+    return parts.slice(-3).join(':').toUpperCase();
+  }
+  return s.length > 6 ? s.slice(-6).toUpperCase() : s;
+};
+
 // --- DEVICE SEARCH SCREEN ---
 const DeviceSearchScreen = ({ onClose, onConnected }) => {
   const [devices, setDevices] = useState([]);
@@ -475,6 +487,8 @@ const DeviceSearchScreen = ({ onClose, onConnected }) => {
   const [error, setError] = useState(bleNativeModuleError || '');
   const [connectingId, setConnectingId] = useState(null);
   const [connectedId, setConnectedId] = useState(null);
+  const [namedOnly, setNamedOnly] = useState(false);
+  const [nameFilter, setNameFilter] = useState('');
 
   useEffect(() => {
     if (!bleManager) {
@@ -482,37 +496,82 @@ const DeviceSearchScreen = ({ onClose, onConnected }) => {
       return;
     }
 
-    setScanning(true);
-    setError('');
+    let cancelled = false;
+    let timeoutId = null;
 
-    const seen = new Set();
-
-    bleManager.startDeviceScan(null, null, (scanError, device) => {
-      if (scanError) {
-        setError(scanError.message || 'Error while scanning for devices.');
-        setScanning(false);
-        return;
+    const runScan = async () => {
+      if (Platform.OS === 'android') {
+        const apiLevel = Platform.Version;
+        const perms = [
+          PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
+          ...(apiLevel >= 31
+            ? [
+                PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN,
+                PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT,
+              ]
+            : []),
+        ].filter(Boolean);
+        try {
+          const result = await PermissionsAndroid.requestMultiple(perms);
+          const denied = Object.keys(result).find((k) => result[k] !== PermissionsAndroid.RESULTS.GRANTED);
+          if (denied && !cancelled) {
+            setError('Bluetooth permission is required to find and connect to your wristband.');
+            setScanning(false);
+            return;
+          }
+        } catch (permErr) {
+          if (!cancelled) {
+            setError(permErr?.message || 'Permission request failed.');
+            setScanning(false);
+          }
+          return;
+        }
       }
-      if (!device) return;
-      if (seen.has(device.id)) return;
-      seen.add(device.id);
-      setDevices((prev) => [
-        ...prev,
-        {
-          id: device.id,
-          name: device.name || device.localName || 'Unknown device',
-        },
-      ]);
-    });
 
-    const timeout = setTimeout(() => {
-      bleManager.stopDeviceScan();
-      setScanning(false);
-    }, 10000);
+      if (cancelled) return;
+
+      setScanning(true);
+      setError('');
+      const seen = new Set();
+
+      bleManager.startDeviceScan(null, null, (scanError, device) => {
+        if (cancelled) return;
+        if (scanError) {
+          setError(scanError.message || 'Error while scanning for devices.');
+          setScanning(false);
+          return;
+        }
+        if (!device) return;
+        if (seen.has(device.id)) return;
+        seen.add(device.id);
+        const hasName = !!(device.name || device.localName);
+        const displayName = hasName
+          ? (device.name || device.localName)
+          : `Unknown device (${shortDeviceId(device.id)})`;
+        setDevices((prev) => [
+          ...prev,
+          {
+            id: device.id,
+            name: displayName,
+            hasName,
+          },
+        ]);
+      });
+
+      timeoutId = setTimeout(() => {
+        if (!cancelled) {
+          bleManager.stopDeviceScan();
+          setScanning(false);
+        }
+      }, 10000);
+    };
+
+    runScan();
 
     return () => {
+      cancelled = true;
       bleManager.stopDeviceScan();
-      clearTimeout(timeout);
+      if (timeoutId != null) clearTimeout(timeoutId);
     };
   }, []);
 
@@ -547,9 +606,33 @@ const DeviceSearchScreen = ({ onClose, onConnected }) => {
       <View style={styles.searchHeader}>
         <Text style={styles.searchTitle}>Searching for devices…</Text>
         <Text style={styles.searchSubtitle}>
-          Make sure your Bluetooth is enabled and your wristband is on.
+          Make sure your Bluetooth is enabled and your wristband is on. To see your ESP32 by name, set its BLE name in firmware (e.g. BLEDevice::init("Sahey")).
         </Text>
       </View>
+
+      {devices.length > 0 ? (
+        <View style={styles.filterSection}>
+          <TextInput
+            style={styles.nameFilterInput}
+            placeholder="Filter by name (e.g. Sahey or ESP32)"
+            placeholderTextColor="#999"
+            value={nameFilter}
+            onChangeText={setNameFilter}
+            autoCapitalize="none"
+            autoCorrect={false}
+          />
+          <TouchableOpacity
+            style={styles.namedOnlyRow}
+            onPress={() => setNamedOnly((v) => !v)}
+            activeOpacity={0.7}
+          >
+            <Text style={styles.namedOnlyLabel}>Only show named devices</Text>
+            <View style={[styles.checkbox, namedOnly && styles.checkboxChecked]}>
+              {namedOnly ? <MaterialCommunityIcons name="check" size={16} color="#FFF" /> : null}
+            </View>
+          </TouchableOpacity>
+        </View>
+      ) : null}
 
       {error ? (
         <View style={styles.errorBox}>
@@ -571,7 +654,9 @@ const DeviceSearchScreen = ({ onClose, onConnected }) => {
       </View>
 
       <FlatList
-        data={devices}
+        data={(namedOnly ? devices.filter((d) => d.hasName) : devices).filter(
+          (d) => !nameFilter.trim() || d.name.toLowerCase().includes(nameFilter.trim().toLowerCase())
+        )}
         keyExtractor={(item) => item.id}
         style={{ marginTop: 24 }}
         renderItem={({ item }) => {
@@ -775,6 +860,42 @@ const styles = StyleSheet.create({
     fontSize: 14,
     color: '#666',
     textAlign: 'center',
+  },
+  filterSection: {
+    marginTop: 12,
+  },
+  nameFilterInput: {
+    backgroundColor: '#F1F3F5',
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    borderRadius: 12,
+    fontSize: 15,
+    color: '#1a1a1a',
+  },
+  namedOnlyRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginTop: 12,
+    paddingVertical: 10,
+    paddingHorizontal: 4,
+  },
+  namedOnlyLabel: {
+    fontSize: 14,
+    color: '#444',
+  },
+  checkbox: {
+    width: 22,
+    height: 22,
+    borderRadius: 6,
+    borderWidth: 2,
+    borderColor: '#CCC',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  checkboxChecked: {
+    backgroundColor: '#3898FC',
+    borderColor: '#3898FC',
   },
   bottomTab: { flexDirection: 'row', height: 75, borderTopWidth: 1, borderColor: '#F0F0F0', paddingBottom: 10, backgroundColor: '#FFF' },
   tabItem: { flex: 1, justifyContent: 'center', alignItems: 'center' },
