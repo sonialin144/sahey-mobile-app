@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useEffect } from 'react';
+import React, { useState, useCallback, useEffect, useRef } from 'react';
 import {
   StyleSheet,
   Text,
@@ -8,17 +8,22 @@ import {
   Modal,
   TextInput,
   KeyboardAvoidingView,
+  Keyboard,
   Platform,
   ActivityIndicator,
   Alert,
   Animated,
   PermissionsAndroid,
+  Dimensions,
+  Pressable,
 } from 'react-native';
 import { MaterialCommunityIcons } from '@expo/vector-icons';
 import * as Contacts from 'expo-contacts';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 // BLE manager is optional (not available in Expo Go)
 let BleManagerClass = null;
+let BleState = null;
 let bleManager = null;
 let bleNativeModuleError =
   'To use Bluetooth device features, create a development build of this app instead of running in Expo Go.';
@@ -26,7 +31,9 @@ let bleNativeModuleError =
 try {
   // This may fail in Expo Go because react-native-ble-plx is not supported there.
   // eslint-disable-next-line global-require
-  BleManagerClass = require('react-native-ble-plx').BleManager;
+  const BlePlx = require('react-native-ble-plx');
+  BleManagerClass = BlePlx.BleManager;
+  BleState = BlePlx.State;
 
   try {
     // In Expo Go, constructing BleManager can still throw because
@@ -44,6 +51,169 @@ try {
   // Keep the short guidance-only message
   bleNativeModuleError =
     'To use Bluetooth device features, create a development build of this app instead of running in Expo Go.';
+}
+
+/** Native OS BT permissions only — no custom permission UI. */
+async function requestBluetoothPermissions() {
+  if (!bleManager) return false;
+  if (Platform.OS === 'android') {
+    const apiLevel = Platform.Version;
+    const perms = [
+      PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
+      ...(apiLevel >= 31
+        ? [
+            PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN,
+            PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT,
+          ]
+        : []),
+    ].filter(Boolean);
+    const result = await PermissionsAndroid.requestMultiple(perms);
+    const denied = Object.keys(result).find((k) => result[k] !== PermissionsAndroid.RESULTS.GRANTED);
+    return !denied;
+  }
+  const state = await bleManager.state();
+  const U = BleState?.Unauthorized ?? 'Unauthorized';
+  const Off = BleState?.PoweredOff ?? 'PoweredOff';
+  if (state === U) return false;
+  if (state === Off) {
+    Alert.alert('Bluetooth is off', 'Turn on Bluetooth to connect your wristband.');
+    return false;
+  }
+  return true;
+}
+
+function deviceNameMatchesSahey(device) {
+  const n = String(device?.name || '').toLowerCase();
+  const ln = String(device?.localName || '').toLowerCase();
+  return n.includes('sahey') || ln.includes('sahey');
+}
+
+function signalLabel(rssi) {
+  if (typeof rssi !== 'number') return 'Strong signal';
+  if (rssi >= -55) return 'Strong signal';
+  if (rssi >= -70) return 'Good signal';
+  return 'Fair signal';
+}
+
+function formatContactCount(n) {
+  return `${n} ${n === 1 ? 'contact' : 'contacts'}`;
+}
+
+function relativeTimeFrom(date) {
+  if (!date) return '';
+  const ms = Date.now() - date.getTime();
+  if (ms < 60 * 1000) return 'just now';
+  const minutes = Math.max(1, Math.round(ms / (60 * 1000)));
+  if (minutes < 60) return `${minutes} minute${minutes === 1 ? '' : 's'} ago`;
+  const hours = Math.max(1, Math.round(minutes / 60));
+  return `${hours} hour${hours === 1 ? '' : 's'} ago`;
+}
+
+const CONTACTS_SERVICE_UUID = '12345678-1234-5678-1234-56789abcdef0';
+const CONTACTS_CHAR_UUID = '12345678-1234-5678-1234-56789abcdef1';
+
+const LAST_BLE_DEVICE_KEY = '@sahey_last_ble_device_v1';
+const CONTACTS_STORAGE_KEY = '@sahey_contacts_v1';
+const SYNCED_CONTACT_IDS_KEY = '@sahey_synced_contact_ids_v1';
+const LAST_SYNCED_AT_KEY = '@sahey_last_synced_at_v1';
+
+async function persistLastBleDevice(deviceId, name) {
+  try {
+    await AsyncStorage.setItem(
+      LAST_BLE_DEVICE_KEY,
+      JSON.stringify({ id: deviceId, name: name || 'Sahey Band' }),
+    );
+  } catch (_) {
+    /* ignore */
+  }
+}
+
+async function clearLastBleDevice() {
+  try {
+    await AsyncStorage.removeItem(LAST_BLE_DEVICE_KEY);
+  } catch (_) {
+    /* ignore */
+  }
+}
+
+async function loadLastBleDevice() {
+  try {
+    const raw = await AsyncStorage.getItem(LAST_BLE_DEVICE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed.id === 'string' && parsed.id.length > 0) {
+      return { id: parsed.id, name: typeof parsed.name === 'string' ? parsed.name : 'Sahey Band' };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+async function loadPersistedContacts() {
+  try {
+    const [contactsRaw, syncedRaw, lastRaw] = await Promise.all([
+      AsyncStorage.getItem(CONTACTS_STORAGE_KEY),
+      AsyncStorage.getItem(SYNCED_CONTACT_IDS_KEY),
+      AsyncStorage.getItem(LAST_SYNCED_AT_KEY),
+    ]);
+
+    const parsedContacts = contactsRaw ? JSON.parse(contactsRaw) : null;
+    const parsedSynced = syncedRaw ? JSON.parse(syncedRaw) : null;
+    const parsedLast = lastRaw ? new Date(lastRaw) : null;
+
+    return {
+      contacts: Array.isArray(parsedContacts) ? parsedContacts : null,
+      syncedContactIds: Array.isArray(parsedSynced) ? parsedSynced : null,
+      lastSyncedAt: parsedLast && !Number.isNaN(parsedLast.getTime()) ? parsedLast : null,
+    };
+  } catch (_) {
+    return { contacts: null, syncedContactIds: null, lastSyncedAt: null };
+  }
+}
+
+async function persistContacts(nextContacts) {
+  try {
+    await AsyncStorage.setItem(CONTACTS_STORAGE_KEY, JSON.stringify(nextContacts));
+  } catch (_) {
+    /* ignore */
+  }
+}
+
+async function persistSyncedContactIds(nextIds) {
+  try {
+    await AsyncStorage.setItem(SYNCED_CONTACT_IDS_KEY, JSON.stringify(nextIds));
+  } catch (_) {
+    /* ignore */
+  }
+}
+
+async function persistLastSyncedAt(nextDate) {
+  try {
+    if (!nextDate) {
+      await AsyncStorage.removeItem(LAST_SYNCED_AT_KEY);
+      return;
+    }
+    await AsyncStorage.setItem(LAST_SYNCED_AT_KEY, nextDate.toISOString());
+  } catch (_) {
+    /* ignore */
+  }
+}
+
+function toBase64(str) {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+  const bytes = Array.from(str).map((c) => c.charCodeAt(0));
+  let result = '';
+  for (let i = 0; i < bytes.length; i += 3) {
+    const b1 = bytes[i];
+    const b2 = i + 1 < bytes.length ? bytes[i + 1] : 0;
+    const b3 = i + 2 < bytes.length ? bytes[i + 2] : 0;
+    result += chars[b1 >> 2];
+    result += chars[((b1 & 3) << 4) | (b2 >> 4)];
+    result += i + 1 < bytes.length ? chars[((b2 & 15) << 2) | (b3 >> 6)] : '=';
+    result += i + 2 < bytes.length ? chars[b3 & 63] : '=';
+  }
+  return result;
 }
 
 export default function App() {
@@ -74,6 +244,15 @@ export default function App() {
   const [isDeviceConnected, setIsDeviceConnected] = useState(false);
   const [contactsEditing, setContactsEditing] = useState(false);
   const [selectedContactIds, setSelectedContactIds] = useState([]);
+  const [connectedDeviceId, setConnectedDeviceId] = useState(null);
+  const [connectedDeviceName, setConnectedDeviceName] = useState('');
+  // Wristband sync state (source of truth for "what's on the device")
+  const [syncedContactIds, setSyncedContactIds] = useState([]);
+  const [lastSyncedAt, setLastSyncedAt] = useState(null); // Date | null
+  // Contacts flow view (main list vs sync screens)
+  const [contactsView, setContactsView] = useState('main'); // 'main' | 'preview' | 'syncing' | 'success'
+  const [syncRunMeta, setSyncRunMeta] = useState(null); // { mode: 'never' | 'delta', addedCount: number }
+  const didHydrateContactsRef = useRef(false);
   const [modalVisible, setModalVisible] = useState(false);
   const [modalInternalVisible, setModalInternalVisible] = useState(false);
   const [newName, setNewName] = useState('');
@@ -81,7 +260,25 @@ export default function App() {
   const [contactsError, setContactsError] = useState('');
   const [pickingFromPhone, setPickingFromPhone] = useState(false);
   const modalAnim = useState(new Animated.Value(0))[0];
+  const [keyboardHeight, setKeyboardHeight] = useState(0);
   const [deviceView, setDeviceView] = useState('main'); // 'main' | 'search'
+  const [deviceOptionsVisible, setDeviceOptionsVisible] = useState(false);
+  const [deviceSheetModalShown, setDeviceSheetModalShown] = useState(false);
+  const deviceSheetProgress = useRef(new Animated.Value(0)).current;
+  const [autoReconnecting, setAutoReconnecting] = useState(false);
+  const [autoSyncing, setAutoSyncing] = useState(false);
+  const [lastAutoSyncIdsKey, setLastAutoSyncIdsKey] = useState(null);
+  const autoSyncSuccessTimerRef = useRef(null);
+
+  const handleConnectPress = useCallback(async () => {
+    if (!bleManager) {
+      Alert.alert('Bluetooth unavailable', bleNativeModuleError || 'Bluetooth is not available.');
+      return;
+    }
+    const ok = await requestBluetoothPermissions();
+    if (!ok) return;
+    setDeviceView('search');
+  }, []);
 
   useEffect(() => {
     if (modalVisible) {
@@ -103,6 +300,144 @@ export default function App() {
       });
     }
   }, [modalVisible, modalInternalVisible, modalAnim]);
+
+  useEffect(() => {
+    const subShow = Keyboard.addListener('keyboardDidShow', (e) => {
+      setKeyboardHeight(e?.endCoordinates?.height ?? 0);
+    });
+    const subHide = Keyboard.addListener('keyboardDidHide', () => {
+      setKeyboardHeight(0);
+    });
+    return () => {
+      subShow.remove();
+      subHide.remove();
+    };
+  }, []);
+
+  // Persisted contacts + sync status (what's on the wristband)
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const persisted = await loadPersistedContacts();
+      if (cancelled) return;
+      if (persisted.contacts) setContacts(persisted.contacts);
+      if (persisted.syncedContactIds) setSyncedContactIds(persisted.syncedContactIds);
+      if (persisted.lastSyncedAt) setLastSyncedAt(persisted.lastSyncedAt);
+      didHydrateContactsRef.current = true;
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!didHydrateContactsRef.current) return;
+    persistContacts(contacts);
+  }, [contacts]);
+
+  useEffect(() => {
+    if (!didHydrateContactsRef.current) return;
+    persistSyncedContactIds(syncedContactIds);
+  }, [syncedContactIds]);
+
+  useEffect(() => {
+    if (!didHydrateContactsRef.current) return;
+    persistLastSyncedAt(lastSyncedAt);
+  }, [lastSyncedAt]);
+
+  useEffect(() => {
+    if (deviceOptionsVisible) {
+      if (!deviceSheetModalShown) {
+        setDeviceSheetModalShown(true);
+        deviceSheetProgress.setValue(0);
+        Animated.timing(deviceSheetProgress, {
+          toValue: 1,
+          duration: 280,
+          useNativeDriver: true,
+        }).start();
+      }
+    } else if (deviceSheetModalShown) {
+      Animated.timing(deviceSheetProgress, {
+        toValue: 0,
+        duration: 220,
+        useNativeDriver: true,
+      }).start(({ finished }) => {
+        if (finished) {
+          setDeviceSheetModalShown(false);
+        }
+      });
+    }
+  }, [deviceOptionsVisible, deviceSheetModalShown, deviceSheetProgress]);
+
+  /** On cold start: reconnect to last paired device if we have a saved id (no scan UI). */
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      if (!bleManager) return;
+      const saved = await loadLastBleDevice();
+      if (!saved || cancelled) return;
+
+      const ok = await requestBluetoothPermissions();
+      if (!ok || cancelled) return;
+
+      setAutoReconnecting(true);
+      try {
+        const device = await bleManager.connectToDevice(saved.id, {
+          timeout: 12000,
+          requestMTU: 256,
+        });
+        await device.discoverAllServicesAndCharacteristics();
+        if (cancelled) {
+          await bleManager.cancelDeviceConnection(device.id).catch(() => {});
+          return;
+        }
+        const nm = device.name || device.localName || saved.name || 'Sahey Band';
+        setConnectedDeviceId(device.id);
+        setConnectedDeviceName(nm);
+        setIsDeviceConnected(true);
+        await persistLastBleDevice(device.id, nm);
+      } catch (_) {
+        /* Out of range or id changed — user can tap Connect to scan again */
+      } finally {
+        if (!cancelled) setAutoReconnecting(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!connectedDeviceId || !bleManager) return;
+
+    const subscription = bleManager.onDeviceDisconnected(connectedDeviceId, () => {
+      setIsDeviceConnected(false);
+      setConnectedDeviceId(null);
+      setConnectedDeviceName('');
+    });
+
+    return () => subscription.remove();
+  }, [connectedDeviceId]);
+
+  const disconnectDevice = useCallback(async () => {
+    if (!connectedDeviceId || !bleManager) return;
+    try {
+      await bleManager.cancelDeviceConnection(connectedDeviceId);
+    } catch (_) {
+      // already disconnected
+    }
+    await clearLastBleDevice();
+    setIsDeviceConnected(false);
+    setConnectedDeviceId(null);
+    setConnectedDeviceName('');
+  }, [connectedDeviceId]);
+
+  // Keep syncedContactIds aligned with the current contacts list.
+  useEffect(() => {
+    setSyncedContactIds((prev) =>
+      prev.filter((id) => contacts.some((c) => c.id === id))
+    );
+  }, [contacts]);
 
   const addContact = () => {
     if (newName && newPhone) {
@@ -173,6 +508,8 @@ export default function App() {
           text: 'Delete',
           style: 'destructive',
           onPress: () => {
+            // Firmware overwrites the entire list on END, so deleting must force a re-sync.
+            setSyncedContactIds([]);
             setContacts((prev) =>
               prev.filter((c) => !selectedContactIds.includes(c.id))
             );
@@ -184,6 +521,44 @@ export default function App() {
     );
   }, [selectedContactIds]);
 
+  const unsyncedContacts = contacts.filter((c) => !syncedContactIds.includes(c.id));
+  const syncedContacts = contacts.filter((c) => syncedContactIds.includes(c.id));
+  const hasUnsynced = unsyncedContacts.length > 0;
+  const neverSynced = syncedContactIds.length === 0;
+  const lastSyncedRelative = relativeTimeFrom(lastSyncedAt);
+  const unsyncedIdsKey = unsyncedContacts.map((c) => c.id).sort().join('|');
+
+  useEffect(() => {
+    if (!didHydrateContactsRef.current) return;
+    if (!isDeviceConnected) return;
+    if (currentTab !== 'contacts') return;
+    if (contactsView !== 'main') return;
+    if (contactsEditing) return;
+    if (!hasUnsynced) return;
+    if (autoSyncing) return;
+    if (!unsyncedIdsKey) return;
+    if (unsyncedIdsKey === lastAutoSyncIdsKey) return;
+
+    setLastAutoSyncIdsKey(unsyncedIdsKey);
+    setAutoSyncing(true);
+    setSyncRunMeta({
+      mode: neverSynced ? 'never' : 'delta',
+      addedCount: unsyncedContacts.length,
+    });
+    setContactsView('syncing');
+  }, [
+    isDeviceConnected,
+    currentTab,
+    contactsView,
+    contactsEditing,
+    hasUnsynced,
+    neverSynced,
+    unsyncedIdsKey,
+    lastAutoSyncIdsKey,
+    autoSyncing,
+    unsyncedContacts.length,
+  ]);
+
   return (
     <SafeAreaProvider>
       <SafeAreaView style={styles.container}>
@@ -192,15 +567,22 @@ export default function App() {
           {currentTab === 'home' && (
             deviceView === 'main' ? (
               <HomeScreen
-                onConnectPress={() => setDeviceView('search')}
+                onConnectPress={handleConnectPress}
                 isConnected={isDeviceConnected}
+                autoReconnecting={autoReconnecting}
+                onOpenDeviceOptions={() => setDeviceOptionsVisible(true)}
                 onViewContacts={() => setCurrentTab('contacts')}
                 contactCount={contacts.length}
               />
             ) : (
               <DeviceSearchScreen
                 onClose={() => setDeviceView('main')}
-                onConnected={() => setIsDeviceConnected(true)}
+                onConnected={(deviceId, name) => {
+                  setIsDeviceConnected(true);
+                  setConnectedDeviceId(deviceId);
+                  setConnectedDeviceName(name || 'Sahey Band');
+                  persistLastBleDevice(deviceId, name || 'Sahey Band');
+                }}
               />
             )
           )}
@@ -215,7 +597,7 @@ export default function App() {
           )}
 
           {/* TAB 3: CONTACTS */}
-          {currentTab === 'contacts' && (
+          {currentTab === 'contacts' && contactsView === 'main' && (
             <ContactsScreen
               contacts={contacts}
               setModalVisible={setModalVisible}
@@ -224,8 +606,65 @@ export default function App() {
               selectedIds={selectedContactIds}
               onToggleSelect={toggleContactSelected}
               onDeleteSelected={deleteSelectedContacts}
+              isDeviceConnected={isDeviceConnected}
+              syncedContactIds={syncedContactIds}
+              unsyncedContacts={unsyncedContacts}
+              neverSynced={neverSynced}
+              hasUnsynced={hasUnsynced}
+              lastSyncedRelative={lastSyncedRelative}
+              onOpenSyncPreview={() => {
+                if (!isDeviceConnected || contacts.length === 0) return;
+                setContactsView('preview');
+              }}
             />
           )}
+
+          {currentTab === 'contacts' && contactsView === 'preview' && (
+            <ContactsSyncPreviewScreen
+              contacts={contacts}
+              unsyncedContacts={unsyncedContacts}
+              syncedContacts={syncedContacts}
+              neverSynced={neverSynced}
+              onBack={() => setContactsView('main')}
+              onStartSync={() => {
+                setSyncRunMeta({
+                  mode: neverSynced ? 'never' : 'delta',
+                  addedCount: unsyncedContacts.length,
+                });
+                setContactsView('syncing');
+              }}
+              formatContactCount={formatContactCount}
+            />
+          )}
+
+          {currentTab === 'contacts' && contactsView === 'syncing' && (
+            <ContactsSyncExecutionScreen
+              connectedDeviceId={connectedDeviceId}
+              isDeviceConnected={isDeviceConnected}
+              bleManager={bleManager}
+              contacts={contacts}
+              unsyncedContacts={unsyncedContacts}
+              syncedContacts={syncedContacts}
+              neverSynced={neverSynced}
+              onCancel={() => {
+                setAutoSyncing(false);
+                setContactsView('main');
+              }}
+              onSuccess={() => {
+                setSyncedContactIds(contacts.map((c) => c.id));
+                setLastSyncedAt(new Date());
+                if (autoSyncing) setAutoSyncing(false);
+                if (autoSyncSuccessTimerRef.current) {
+                  clearTimeout(autoSyncSuccessTimerRef.current);
+                }
+                setContactsView('main');
+              }}
+              syncRunMeta={syncRunMeta}
+              signalLabel={signalLabel}
+            />
+          )}
+
+          {/* Success screen intentionally omitted: we rely on per-contact synced indicators. */}
         </View>
 
         {/* Bottom Navigation */}
@@ -258,7 +697,160 @@ export default function App() {
           </TouchableOpacity>
         </View>
 
-        {/* Modal for Adding Contacts remains the same... */}
+        <Modal
+          visible={modalInternalVisible}
+          transparent
+          animationType="none"
+          onRequestClose={() => setModalVisible(false)}
+        >
+          <View style={styles.modalOverlay}>
+            <TouchableOpacity
+              style={{ flex: 1 }}
+              activeOpacity={1}
+              onPress={() => setModalVisible(false)}
+            />
+            <KeyboardAvoidingView
+              behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+              keyboardVerticalOffset={0}
+              style={{ flex: 1, justifyContent: 'flex-end' }}
+            >
+              <View style={{ marginBottom: Platform.OS === 'android' ? keyboardHeight : 0, width: '100%' }}>
+                <Animated.View
+                  style={[
+                    styles.modalContent,
+                    {
+                      transform: [
+                        {
+                          translateY: modalAnim.interpolate({
+                            inputRange: [0, 1],
+                            outputRange: [420, 0],
+                          }),
+                        },
+                      ],
+                    },
+                  ]}
+                >
+                  <Text style={styles.modalTitle}>Add emergency contact</Text>
+
+                <TouchableOpacity
+                  style={styles.pickFromPhoneButton}
+                  onPress={pickContactFromPhone}
+                  disabled={pickingFromPhone}
+                >
+                  {pickingFromPhone ? (
+                    <ActivityIndicator color="#3898FC" />
+                  ) : (
+                    <MaterialCommunityIcons name="book-account" size={22} color="#3898FC" />
+                  )}
+                  <Text style={styles.pickFromPhoneText}>
+                    {pickingFromPhone ? 'Opening…' : 'Pick from phone'}
+                  </Text>
+                </TouchableOpacity>
+
+                <Text style={styles.modalDivider}>— or enter manually —</Text>
+
+                {contactsError ? (
+                  <Text style={styles.contactsError}>{contactsError}</Text>
+                ) : null}
+
+                <TextInput
+                  style={styles.input}
+                  placeholder="Name"
+                  placeholderTextColor="#999"
+                  value={newName}
+                  onChangeText={setNewName}
+                />
+                <TextInput
+                  style={styles.input}
+                  placeholder="Phone number"
+                  placeholderTextColor="#999"
+                  keyboardType="phone-pad"
+                  value={newPhone}
+                  onChangeText={setNewPhone}
+                />
+
+                  <View style={styles.modalButtons}>
+                    <TouchableOpacity
+                      style={[styles.btn, styles.btnCancel]}
+                      onPress={() => {
+                        setModalVisible(false);
+                        setContactsError('');
+                      }}
+                    >
+                      <Text style={{ fontWeight: '700', color: '#333' }}>Cancel</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity style={[styles.btn, styles.btnSave]} onPress={addContact}>
+                      <Text style={{ fontWeight: '700', color: '#FFF' }}>Save</Text>
+                    </TouchableOpacity>
+                  </View>
+                </Animated.View>
+              </View>
+            </KeyboardAvoidingView>
+          </View>
+        </Modal>
+
+        <Modal
+          visible={deviceSheetModalShown}
+          transparent
+          animationType="none"
+          onRequestClose={() => setDeviceOptionsVisible(false)}
+        >
+          <View style={styles.deviceSheetRoot}>
+            <Animated.View
+              style={[
+                styles.deviceSheetBackdropFill,
+                {
+                  opacity: deviceSheetProgress,
+                },
+              ]}
+            >
+              <Pressable
+                style={StyleSheet.absoluteFillObject}
+                onPress={() => setDeviceOptionsVisible(false)}
+              />
+            </Animated.View>
+            <Animated.View
+              style={[
+                styles.deviceSheetPanelWrap,
+                {
+                  transform: [
+                    {
+                      translateY: deviceSheetProgress.interpolate({
+                        inputRange: [0, 1],
+                        outputRange: [Math.min(360, Dimensions.get('window').height * 0.45), 0],
+                      }),
+                    },
+                  ],
+                },
+              ]}
+            >
+              <View style={styles.deviceSheetPanel}>
+                <View style={styles.deviceSheetHandle} />
+                <Text style={styles.deviceSheetSectionLabel} numberOfLines={1}>
+                  {(connectedDeviceName || 'Sahey Band').toUpperCase()}
+                </Text>
+                <TouchableOpacity
+                  style={styles.deviceSheetDisconnectCard}
+                  activeOpacity={0.85}
+                  onPress={async () => {
+                    setDeviceOptionsVisible(false);
+                    await disconnectDevice();
+                  }}
+                >
+                  <MaterialCommunityIcons name="close" size={22} color="#B91C1C" />
+                  <Text style={styles.deviceSheetDisconnectTitle}>Disconnect device</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={styles.deviceSheetCancelBtn}
+                  onPress={() => setDeviceOptionsVisible(false)}
+                  activeOpacity={0.8}
+                >
+                  <Text style={styles.deviceSheetCancelText}>Cancel</Text>
+                </TouchableOpacity>
+              </View>
+            </Animated.View>
+          </View>
+        </Modal>
       </SafeAreaView>
     </SafeAreaProvider>
   );
@@ -288,7 +880,20 @@ function formatPhoneForDisplay(raw) {
 }
 
 // --- HOME SCREEN ---
-const HomeScreen = ({ onConnectPress, isConnected, onViewContacts, onViewCommands, contactCount }) => (
+const HomeScreen = ({
+  onConnectPress,
+  isConnected,
+  autoReconnecting,
+  onOpenDeviceOptions,
+  onViewContacts,
+  contactCount,
+}) => {
+  const statusLine = isConnected
+    ? 'Connected'
+    : autoReconnecting
+      ? 'Reconnecting…'
+      : 'Not connected';
+  return (
   <View style={styles.screenInner}>
     <View style={styles.headerRow}>
       <View>
@@ -297,16 +902,18 @@ const HomeScreen = ({ onConnectPress, isConnected, onViewContacts, onViewCommand
           <View
             style={[
               styles.pulseDot,
-              !isConnected && styles.pulseDotOff,
+              !isConnected && !autoReconnecting && styles.pulseDotOff,
+              autoReconnecting && styles.pulseDotReconnect,
             ]}
           />
           <Text
             style={[
               styles.statusText,
-              !isConnected && styles.statusTextOff,
+              !isConnected && !autoReconnecting && styles.statusTextOff,
+              autoReconnecting && styles.statusTextReconnect,
             ]}
           >
-            {isConnected ? 'Connected' : 'Not connected'}
+            {statusLine}
           </Text>
         </View>
       </View>
@@ -317,15 +924,43 @@ const HomeScreen = ({ onConnectPress, isConnected, onViewContacts, onViewCommand
     </View>
 
     <View style={styles.imageContainer}>
-      <MaterialCommunityIcons name="watch-variant" size={140} color="#3898FC" />
+      {isConnected ? (
+        <TouchableOpacity
+          style={styles.imageContainerMenuBtn}
+          onPress={onOpenDeviceOptions}
+          hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+          activeOpacity={0.7}
+        >
+          <MaterialCommunityIcons name="dots-horizontal" size={22} color="#333" />
+        </TouchableOpacity>
+      ) : null}
+      <MaterialCommunityIcons
+        name="watch-variant"
+        size={140}
+        color="#3898FC"
+      />
       <Text style={styles.imageLabel}>Wristband v1.0.4</Text>
-      <Text style={styles.connectInfo}>
-        Connect your device to unlock device features!
-      </Text>
-      <TouchableOpacity style={styles.connectButton} onPress={onConnectPress}>
-        <MaterialCommunityIcons name="bluetooth" size={20} color="#FFF" />
-        <Text style={styles.connectButtonText}>Connect</Text>
-      </TouchableOpacity>
+      {isConnected ? (
+        <View style={styles.connectedPill}>
+          <View style={styles.connectedPillDot} />
+          <Text style={styles.connectedPillText}>Connected</Text>
+        </View>
+      ) : autoReconnecting ? (
+        <View style={styles.homeReconnectingBox}>
+          <ActivityIndicator color="#3898FC" style={{ marginBottom: 10 }} />
+          <Text style={styles.connectInfo}>Reconnecting to your wristband…</Text>
+        </View>
+      ) : (
+        <>
+          <Text style={styles.connectInfo}>
+            Connect your device to unlock device features!
+          </Text>
+          <TouchableOpacity style={[styles.connectButton, styles.homeConnectButton]} onPress={onConnectPress}>
+            <MaterialCommunityIcons name="bluetooth" size={20} color="#FFF" />
+            <Text style={styles.connectButtonText}>Connect</Text>
+          </TouchableOpacity>
+        </>
+      )}
     </View>
 
     <Text style={styles.sectionTitle}>Emergency Contacts</Text>
@@ -349,7 +984,8 @@ const HomeScreen = ({ onConnectPress, isConnected, onViewContacts, onViewCommand
       </View>
     </TouchableOpacity>
   </View>
-);
+  );
+};
 
 // --- CONTACTS SCREEN ---
 const ContactsScreen = ({
@@ -360,93 +996,609 @@ const ContactsScreen = ({
   selectedIds,
   onToggleSelect,
   onDeleteSelected,
-}) => (
-  <View style={styles.screenInner}>
-    <View style={styles.contactsHeaderRow}>
-      <View>
-        <Text style={styles.title}>Contacts</Text>
-        <Text style={styles.subtitle}>People who receive alerts.</Text>
+  isDeviceConnected,
+  syncedContactIds,
+  unsyncedContacts,
+  neverSynced,
+  hasUnsynced,
+  lastSyncedRelative,
+  onOpenSyncPreview,
+}) => {
+  const showSyncBanner = isDeviceConnected && contacts.length > 0 && !isEditing;
+
+  const syncTitle =
+    neverSynced
+      ? 'Sync to wristband'
+      : hasUnsynced
+        ? 'Wristband out of date'
+        : 'Wristband up to date';
+
+  const syncSub =
+    neverSynced
+      ? `${formatContactCount(contacts.length)} · Never synced`
+      : hasUnsynced
+        ? `${unsyncedContacts.length} new ${unsyncedContacts.length === 1 ? 'contact' : 'contacts'} not yet synced`
+        : `Last synced ${lastSyncedRelative}`;
+
+  const syncState = neverSynced ? 'never' : hasUnsynced ? 'delta' : 'upToDate';
+
+  const Banner = () => {
+    if (!showSyncBanner) return null;
+
+    if (syncState === 'never') {
+      return (
+        <TouchableOpacity
+          style={styles.syncBannerNever}
+          onPress={onOpenSyncPreview}
+          activeOpacity={0.85}
+        >
+          <View style={styles.syncBannerLeft}>
+            <MaterialCommunityIcons name="refresh" size={20} color="#3898FC" />
+            <View style={{ flex: 1, marginLeft: 10 }}>
+              <Text style={styles.syncBannerTitleBlue}>{syncTitle}</Text>
+              <Text style={styles.syncBannerSubBlue}>{syncSub}</Text>
+            </View>
+          </View>
+          <MaterialCommunityIcons name="chevron-right" size={20} color="#3898FC" />
+        </TouchableOpacity>
+      );
+    }
+
+    if (syncState === 'delta') {
+      return (
+        <TouchableOpacity
+          style={styles.syncBannerDelta}
+          onPress={onOpenSyncPreview}
+          activeOpacity={0.85}
+        >
+          <View style={styles.syncBannerLeft}>
+            <MaterialCommunityIcons name="sync" size={20} color="#F59E0B" />
+            <View style={{ flex: 1, marginLeft: 10 }}>
+              <Text style={styles.syncBannerTitleAmber}>{syncTitle}</Text>
+              <Text style={styles.syncBannerSubAmber}>{syncSub}</Text>
+            </View>
+          </View>
+          <MaterialCommunityIcons name="chevron-right" size={20} color="#F59E0B" />
+        </TouchableOpacity>
+      );
+    }
+
+    return (
+      <View style={styles.syncBannerUpToDate}>
+        <View style={styles.syncBannerLeft}>
+          <MaterialCommunityIcons name="check" size={20} color="#4CAF50" />
+          <View style={{ flex: 1, marginLeft: 10 }}>
+            <Text style={styles.syncBannerTitleGreen}>{syncTitle}</Text>
+            <Text style={styles.syncBannerSubGreen}>{syncSub}</Text>
+          </View>
+        </View>
       </View>
-      {contacts.length > 0 && (
-        <TouchableOpacity onPress={onToggleEdit}>
-          <Text style={styles.editButtonText}>{isEditing ? 'Done' : 'Edit'}</Text>
+    );
+  };
+
+  return (
+    <View style={styles.screenInner}>
+      <View style={styles.contactsHeaderRow}>
+        <View>
+          <Text style={styles.title}>Contacts</Text>
+          <Text style={styles.subtitle}>People who receive alerts.</Text>
+        </View>
+        {contacts.length > 0 && (
+          <TouchableOpacity onPress={onToggleEdit}>
+            <Text style={styles.editButtonText}>{isEditing ? 'Done' : 'Edit'}</Text>
+          </TouchableOpacity>
+        )}
+      </View>
+
+      <Banner />
+
+      {contacts.length === 0 ? (
+        <View style={styles.emptyContacts}>
+          <Text style={styles.emptyTitle}>There are currently no emergency contacts added.</Text>
+          <Text style={styles.emptyBody}>
+            Please add contacts you want to alert when you are in danger.
+          </Text>
+        </View>
+      ) : (
+        <FlatList
+          data={contacts}
+          keyExtractor={(item) => item.id}
+          style={{ marginTop: 20 }}
+          renderItem={({ item }) => {
+            const isSelected = selectedIds.includes(item.id);
+            return (
+              <TouchableOpacity
+                onPress={() => (isEditing ? onToggleSelect(item.id) : null)}
+                activeOpacity={isEditing ? 0.8 : 1}
+              >
+                <View
+                  style={[
+                    styles.contactCard,
+                    isEditing && isSelected && styles.contactCardSelected,
+                  ]}
+                >
+                  <View>
+                    <Text style={styles.contactName}>{item.name}</Text>
+                    <Text style={styles.contactPhone}>{formatPhoneForDisplay(item.phone)}</Text>
+                  </View>
+                  {isEditing && (
+                    <MaterialCommunityIcons
+                      name={isSelected ? 'checkbox-marked' : 'checkbox-blank-outline'}
+                      size={22}
+                      color={isSelected ? '#3898FC' : '#CCC'}
+                    />
+                  )}
+                </View>
+              </TouchableOpacity>
+            );
+          }}
+        />
+      )}
+
+      {isEditing ? (
+        <TouchableOpacity
+          style={[
+            styles.addButton,
+            styles.deleteButton,
+            selectedIds.length === 0 && styles.deleteButtonDisabled,
+          ]}
+          onPress={onDeleteSelected}
+          disabled={selectedIds.length === 0}
+        >
+          <MaterialCommunityIcons name="trash-can-outline" size={22} color="#FFF" />
+          <Text style={styles.addButtonText}>Delete</Text>
+        </TouchableOpacity>
+      ) : (
+        <TouchableOpacity style={styles.addButton} onPress={() => setModalVisible(true)}>
+          <MaterialCommunityIcons name="plus" size={24} color="white" />
+          <Text style={styles.addButtonText}>Add Contact</Text>
         </TouchableOpacity>
       )}
     </View>
+  );
+};
 
-    {contacts.length === 0 ? (
-      <View style={styles.emptyContacts}>
-        <Text style={styles.emptyTitle}>
-          There are currently no emergency contacts added.
-        </Text>
-        <Text style={styles.emptyBody}>
-          Please add contacts you want to alert when you are in danger.
-        </Text>
+// --- CONTACTS SYNC: Preview Screen ---
+const ContactsSyncPreviewScreen = ({
+  contacts,
+  unsyncedContacts,
+  syncedContacts,
+  neverSynced,
+  onBack,
+  onStartSync,
+}) => {
+  const title = neverSynced ? 'Ready to sync' : "What's changing";
+  const subtitle = neverSynced
+    ? 'These contacts will be sent to your Sahey Band.'
+    : 'Only new contacts will be added — existing ones stay untouched.';
+
+  const deltaCount = unsyncedContacts.length;
+  const ctaText = neverSynced
+    ? `Sync ${contacts.length} ${contacts.length === 1 ? 'contact' : 'contacts'}`
+    : `Sync ${deltaCount} new ${deltaCount === 1 ? 'contact' : 'contacts'}`;
+
+  const RowCard = ({ item, badgeText, badgeColorStyle, cardStyle }) => (
+    <View style={[styles.syncPreviewCardBase, cardStyle]}>
+      <View>
+        <Text style={styles.contactName}>{item.name}</Text>
+        <Text style={styles.contactPhone}>{formatPhoneForDisplay(item.phone)}</Text>
       </View>
-    ) : (
-      <FlatList
-        data={contacts}
-        keyExtractor={(item) => item.id}
-        style={{ marginTop: 20 }}
-        renderItem={({ item }) => {
-          const isSelected = selectedIds.includes(item.id);
-          return (
-            <TouchableOpacity
-              onPress={() => (isEditing ? onToggleSelect(item.id) : null)}
-              activeOpacity={isEditing ? 0.8 : 1}
-            >
-              <View
-                style={[
-                  styles.contactCard,
-                  isEditing && isSelected && styles.contactCardSelected,
-                ]}
-              >
-                <View>
-                  <Text style={styles.contactName}>{item.name}</Text>
-                  <Text style={styles.contactPhone}>
-                    {formatPhoneForDisplay(item.phone)}
-                  </Text>
-                </View>
-                {isEditing && (
-                  <MaterialCommunityIcons
-                    name={
-                      isSelected ? 'checkbox-marked' : 'checkbox-blank-outline'
-                    }
-                    size={22}
-                    color={isSelected ? '#3898FC' : '#CCC'}
-                  />
-                )}
-              </View>
-            </TouchableOpacity>
-          );
-        }}
-      />
-    )}
+      <View style={styles.syncPreviewBadgeWrap}>
+        <Text style={[styles.syncPreviewBadgeBase, badgeColorStyle]}>{badgeText}</Text>
+      </View>
+    </View>
+  );
 
-    {isEditing ? (
-      <TouchableOpacity
-        style={[
-          styles.addButton,
-          styles.deleteButton,
-          selectedIds.length === 0 && styles.deleteButtonDisabled,
-        ]}
-        onPress={onDeleteSelected}
-        disabled={selectedIds.length === 0}
-      >
-        <MaterialCommunityIcons name="trash-can-outline" size={22} color="#FFF" />
-        <Text style={styles.addButtonText}>Delete</Text>
+  return (
+    <View style={styles.screenInner}>
+      <View style={styles.syncPreviewHeaderRow}>
+        <TouchableOpacity onPress={onBack} hitSlop={12} activeOpacity={0.8}>
+          <MaterialCommunityIcons name="chevron-left" size={28} color="#000" />
+        </TouchableOpacity>
+      </View>
+
+      <View style={styles.syncPreviewHeader}>
+        <Text style={styles.syncPreviewTitle}>{title}</Text>
+        <Text style={styles.syncPreviewSubtitle}>{subtitle}</Text>
+      </View>
+
+      {neverSynced ? (
+        <View style={{ width: '100%', marginTop: 18 }}>
+          {contacts.map((c) => (
+            <RowCard
+              key={c.id}
+              item={c}
+              badgeText="New"
+              badgeColorStyle={styles.syncPreviewBadgeNewText}
+              cardStyle={styles.syncPreviewCardNew}
+            />
+          ))}
+        </View>
+      ) : (
+        <View style={{ width: '100%', marginTop: 18 }}>
+          <Text style={styles.syncPreviewSectionLabel}>Adding to wristband</Text>
+          {unsyncedContacts.map((c) => (
+            <RowCard
+              key={c.id}
+              item={c}
+              badgeText="New"
+              badgeColorStyle={styles.syncPreviewBadgeNewText}
+              cardStyle={styles.syncPreviewCardNew}
+            />
+          ))}
+
+          <Text style={[styles.syncPreviewSectionLabel, { marginTop: 10 }]}>
+            Already on wristband
+          </Text>
+          {syncedContacts.map((c) => (
+            <RowCard
+              key={c.id}
+              item={c}
+              badgeText="Synced"
+              badgeColorStyle={styles.syncPreviewBadgeSyncedText}
+              cardStyle={styles.syncPreviewCardSynced}
+            />
+          ))}
+        </View>
+      )}
+
+      <TouchableOpacity style={styles.syncPreviewCtaBtn} onPress={onStartSync} activeOpacity={0.9}>
+        <Text style={styles.syncPreviewCtaText}>{ctaText}</Text>
       </TouchableOpacity>
-    ) : (
-      <TouchableOpacity
-        style={styles.addButton}
-        onPress={() => setModalVisible(true)}
-      >
-        <MaterialCommunityIcons name="plus" size={24} color="white" />
-        <Text style={styles.addButtonText}>Add Contact</Text>
+
+      <TouchableOpacity style={styles.syncPreviewGhostBtn} onPress={onBack} activeOpacity={0.8}>
+        <Text style={styles.syncPreviewGhostBtnText}>Cancel</Text>
       </TouchableOpacity>
-    )}
-  </View>
-);
+    </View>
+  );
+};
+
+// --- CONTACTS SYNC: Execution Screen ---
+const ContactsSyncExecutionScreen = ({
+  connectedDeviceId,
+  isDeviceConnected,
+  bleManager,
+  contacts,
+  unsyncedContacts,
+  syncedContacts,
+  neverSynced,
+  onCancel,
+  onSuccess,
+}) => {
+  const totalUnsynced = unsyncedContacts.length;
+  const progressAnim = useRef(new Animated.Value(0)).current;
+  const rotationAnim = useRef(new Animated.Value(0)).current;
+  const progressRotating = useRef(null);
+
+  const [isRunning, setIsRunning] = useState(true);
+  const [syncError, setSyncError] = useState(null);
+  const [stepText, setStepText] = useState('checking connection');
+  const [percent, setPercent] = useState(0);
+
+  const [rowStatus, setRowStatus] = useState(() => {
+    const initial = {};
+    for (const c of unsyncedContacts) initial[c.id] = 'pending';
+    return initial;
+  });
+  const rowStatusRef = useRef(rowStatus);
+  useEffect(() => {
+    rowStatusRef.current = rowStatus;
+  }, [rowStatus]);
+
+  const runSync = useCallback(async () => {
+    if (!bleManager || !connectedDeviceId || !isDeviceConnected) {
+      setSyncError('No device connected. Please reconnect your wristband.');
+      setIsRunning(false);
+      return;
+    }
+    if (unsyncedContacts.length === 0) {
+      onSuccess();
+      return;
+    }
+
+    setSyncError(null);
+    setIsRunning(true);
+
+    // Convert failed → pending on retry; keep done.
+    const next = { ...rowStatusRef.current };
+    for (const c of unsyncedContacts) {
+      if (next[c.id] === 'failed') next[c.id] = 'pending';
+    }
+    setRowStatus(next);
+
+    const confirmedCount = unsyncedContacts.filter((c) => next[c.id] === 'done').length;
+    const startPercent = totalUnsynced === 0 ? 0 : Math.round((confirmedCount / totalUnsynced) * 100);
+    setPercent(startPercent);
+    progressAnim.setValue(totalUnsynced === 0 ? 0 : confirmedCount / totalUnsynced);
+
+    const startRotation = () => {
+      rotationAnim.setValue(0);
+      progressRotating.current = Animated.loop(
+        Animated.timing(rotationAnim, {
+          toValue: 1,
+          duration: 900,
+          useNativeDriver: true,
+        })
+      );
+      progressRotating.current.start();
+    };
+    const stopRotation = () => {
+      try {
+        progressRotating.current?.stop();
+      } catch (_) {
+        // ignore
+      }
+    };
+
+    startRotation();
+
+    let currentContact = null;
+
+    const unsyncedIdSet = new Set(unsyncedContacts.map((c) => c.id));
+    const sendContacts = contacts;
+
+    try {
+      setStepText('discovering services');
+      await bleManager.discoverAllServicesAndCharacteristicsForDevice(connectedDeviceId);
+
+      const write = async (value) => {
+        const b64 = toBase64(value);
+        try {
+          await bleManager.writeCharacteristicWithResponseForDevice(
+            connectedDeviceId,
+            CONTACTS_SERVICE_UUID,
+            CONTACTS_CHAR_UUID,
+            b64,
+          );
+        } catch (firstErr) {
+          await bleManager.writeCharacteristicWithoutResponseForDevice(
+            connectedDeviceId,
+            CONTACTS_SERVICE_UUID,
+            CONTACTS_CHAR_UUID,
+            b64,
+          );
+        }
+      };
+
+      setStepText('writing START');
+      await write(`START:${sendContacts.length}`);
+      let completedUnsyncedCount = confirmedCount;
+      for (let i = 0; i < sendContacts.length; i++) {
+        const c = sendContacts[i];
+        currentContact = c;
+        const markDone = unsyncedIdSet.has(c.id) && next[c.id] !== 'done';
+
+        if (markDone) {
+          setStepText(`sending ${c.name}`);
+          setRowStatus((prev) => ({ ...prev, [c.id]: 'sending' }));
+        }
+
+        const digits = String(c.phone).replace(/\D/g, '');
+        await write(`${c.name}|${digits}`);
+
+        if (markDone) {
+          setRowStatus((prev) => ({ ...prev, [c.id]: 'done' }));
+          completedUnsyncedCount += 1;
+          const p = totalUnsynced === 0 ? 100 : Math.round((completedUnsyncedCount / totalUnsynced) * 100);
+          setPercent(p);
+          Animated.timing(progressAnim, {
+            toValue: totalUnsynced === 0 ? 1 : completedUnsyncedCount / totalUnsynced,
+            duration: 280,
+            useNativeDriver: true,
+          }).start();
+        }
+      }
+
+      setStepText('writing END');
+      await write('END');
+
+      stopRotation();
+      setIsRunning(false);
+      onSuccess();
+    } catch (e) {
+      stopRotation();
+      progressAnim.stopAnimation();
+
+      setIsRunning(false);
+      const failed =
+        currentContact && unsyncedIdSet.has(currentContact.id)
+          ? currentContact
+          : unsyncedContacts[0];
+      const failedName = failed?.name || 'contact';
+      setRowStatus((prev) => ({ ...prev, [failed.id]: 'failed' }));
+
+      setSyncError(`Failed sending ${failedName}. Check your wristband is still in range.`);
+    }
+  }, [
+    bleManager,
+    connectedDeviceId,
+    isDeviceConnected,
+    contacts,
+    onSuccess,
+    progressAnim,
+    rotationAnim,
+    totalUnsynced,
+    unsyncedContacts,
+  ]);
+
+  useEffect(() => {
+    runSync();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const iconRotation = rotationAnim.interpolate({
+    inputRange: [0, 1],
+    outputRange: ['0deg', '360deg'],
+  });
+  const isNoDeviceConnectedError = syncError?.startsWith('No device connected');
+
+  return (
+    <View style={styles.screenInner}>
+      <View style={styles.syncExecHeaderRow}>
+        {!isRunning && syncError ? (
+          <TouchableOpacity onPress={onCancel} hitSlop={12} activeOpacity={0.8}>
+            <MaterialCommunityIcons name="chevron-left" size={28} color="#000" />
+          </TouchableOpacity>
+        ) : (
+          <View style={{ width: 28 }} />
+        )}
+      </View>
+
+      <View style={styles.syncExecTop}>
+        <View style={styles.syncExecIconCircle}>
+          <Animated.View style={{ transform: [{ rotate: iconRotation }] }}>
+            <MaterialCommunityIcons name="sync" size={34} color="#3898FC" />
+          </Animated.View>
+        </View>
+        <Text style={styles.syncExecTitle}>Syncing contacts…</Text>
+        <Text style={styles.syncExecSubtitle}>Sending to Sahey Band</Text>
+
+        <View style={styles.syncExecProgressBarTrack}>
+          <Animated.View
+            style={[
+              styles.syncExecProgressBarFill,
+              { transform: [{ scaleX: progressAnim }] },
+            ]}
+          />
+        </View>
+
+        <View style={styles.syncExecProgressLabelRow}>
+          <Text style={styles.syncExecStepText}>{stepText}</Text>
+          <Text style={styles.syncExecPercentText}>{percent}%</Text>
+        </View>
+      </View>
+
+      {unsyncedContacts.length === 0 && !syncError ? (
+        <View style={{ marginTop: 16 }}>
+          <Text style={styles.syncExecErrorText}>No contacts to sync.</Text>
+        </View>
+      ) : (
+        <View style={{ width: '100%', marginTop: 16 }}>
+          {!neverSynced && (
+            <>
+              <Text style={styles.syncExecSectionLabel}>Already on wristband</Text>
+              {syncedContacts.map((c) => (
+                <View key={c.id} style={[styles.syncExecRow, styles.syncExecRowGrey]}>
+                  <View>
+                    <Text style={styles.syncExecRowName}>{c.name}</Text>
+                    <Text style={styles.syncExecRowPhone}>{formatPhoneForDisplay(c.phone)}</Text>
+                  </View>
+                  <Text style={styles.syncExecDashIcon}>—</Text>
+                </View>
+              ))}
+            </>
+          )}
+
+          <Text style={[styles.syncExecSectionLabel, { marginTop: neverSynced ? 0 : 12 }]}>
+            Sending now
+          </Text>
+          {unsyncedContacts.map((c) => {
+            const st = rowStatus[c.id] || 'pending';
+            return (
+              <View key={c.id} style={[styles.syncExecRow, st === 'failed' ? styles.syncExecRowFailed : null]}>
+                <View>
+                  <Text style={styles.syncExecRowName}>{c.name}</Text>
+                  <Text style={styles.syncExecRowPhone}>{formatPhoneForDisplay(c.phone)}</Text>
+                </View>
+                <View style={styles.syncExecIconRight}>
+                  {st === 'pending' ? (
+                    <View style={styles.syncExecDot} />
+                  ) : st === 'sending' ? (
+                    <ActivityIndicator size="small" color="#3898FC" />
+                  ) : st === 'done' ? (
+                    <MaterialCommunityIcons name="check" size={18} color="#4CAF50" />
+                  ) : st === 'failed' ? (
+                    <Text style={styles.syncExecFailedX}>✕</Text>
+                  ) : (
+                    <View style={styles.syncExecDot} />
+                  )}
+                </View>
+              </View>
+            );
+          })}
+
+          {syncError ? (
+            <View style={{ marginTop: 12 }}>
+              <Text style={styles.syncExecErrorText}>{syncError}</Text>
+            </View>
+          ) : null}
+        </View>
+      )}
+
+      {syncError ? (
+        <View style={{ marginTop: 16, width: '100%' }}>
+          {!isNoDeviceConnectedError ? (
+            <TouchableOpacity style={styles.syncExecTryAgainBtn} onPress={runSync} activeOpacity={0.9}>
+              <Text style={styles.syncExecTryAgainText}>Try again</Text>
+            </TouchableOpacity>
+          ) : null}
+          <TouchableOpacity style={styles.syncExecCancelGhostBtn} onPress={onCancel} activeOpacity={0.8}>
+            <Text style={styles.syncExecCancelGhostText}>Cancel</Text>
+          </TouchableOpacity>
+        </View>
+      ) : null}
+    </View>
+  );
+};
+
+// --- CONTACTS SYNC: Success Screen ---
+const ContactsSyncSuccessScreen = ({ contacts, syncRunMeta, lastSyncedRelative, onDone }) => {
+  const mode = syncRunMeta?.mode || 'delta';
+  const addedCount = syncRunMeta?.addedCount ?? contacts.length;
+  const n = contacts.length;
+
+  const title = mode === 'delta' ? 'Wristband updated!' : 'Contacts synced!';
+  const subtitle =
+    mode === 'delta'
+      ? `${addedCount} new ${addedCount === 1 ? 'contact' : 'contacts'} added to your Sahey Band.`
+      : `All ${n} ${n === 1 ? 'contact' : 'contacts'} sent to your Sahey Band.`;
+
+  const checkAnim = useRef(new Animated.Value(0)).current;
+  useEffect(() => {
+    Animated.timing(checkAnim, { toValue: 1, duration: 450, useNativeDriver: true }).start();
+  }, [checkAnim]);
+
+  const checkScale = checkAnim.interpolate({ inputRange: [0, 1], outputRange: [0.2, 1] });
+  const checkOpacity = checkAnim;
+
+  return (
+    <View style={styles.screenInner}>
+      <View style={styles.syncSuccessTop}>
+        <View style={styles.syncSuccessCircle}>
+          <Animated.View style={{ transform: [{ scale: checkScale }], opacity: checkOpacity }}>
+            <MaterialCommunityIcons name="check-bold" size={44} color="#16A34A" />
+          </Animated.View>
+        </View>
+        <Text style={styles.syncSuccessTitle}>{title}</Text>
+        <Text style={styles.syncSuccessSubtitle}>{subtitle}</Text>
+      </View>
+
+      <View style={styles.syncSuccessSummaryCard}>
+        {contacts.map((c) => (
+          <View key={c.id} style={styles.syncSuccessSummaryRow}>
+            <MaterialCommunityIcons name="check" size={18} color="#16A34A" />
+            <View style={{ flex: 1, marginLeft: 10 }}>
+              <Text style={styles.syncSuccessSummaryName}>{c.name}</Text>
+              <Text style={styles.syncSuccessSummaryPhone}>{formatPhoneForDisplay(c.phone)}</Text>
+            </View>
+          </View>
+        ))}
+      </View>
+
+      <TouchableOpacity
+        style={[styles.wideBlackButton, { marginTop: 18, width: '100%' }]}
+        onPress={onDone}
+        activeOpacity={0.9}
+      >
+        <Text style={styles.wideBlackButtonText}>Done</Text>
+      </TouchableOpacity>
+
+      <Text style={styles.syncSuccessTimestamp}>
+        Last synced {lastSyncedRelative} · Sahey Band
+      </Text>
+    </View>
+  );
+};
 
 const CommandsScreen = ({ commands, onToggleCommand, onUpdatePhrase }) => (
   <View style={styles.screenInner}>
@@ -490,231 +1642,314 @@ const CommandsScreen = ({ commands, onToggleCommand, onUpdatePhrase }) => (
   </View>
 );
 
-// Short ID for BLE device (id is often UUID or MAC) so "Unknown" entries are distinguishable
-const shortDeviceId = (id) => {
-  if (!id) return '';
-  const s = String(id).trim();
-  if (s.includes(':')) {
-    const parts = s.split(':');
-    return parts.slice(-3).join(':').toUpperCase();
-  }
-  return s.length > 6 ? s.slice(-6).toUpperCase() : s;
-};
+/** Three staggered ripple rings + Bluetooth icon (scanning). */
+function ScanRippleRings() {
+  const a0 = useRef(new Animated.Value(0)).current;
+  const a1 = useRef(new Animated.Value(0)).current;
+  const a2 = useRef(new Animated.Value(0)).current;
+
+  useEffect(() => {
+    const ringLoop = (anim, delayMs) =>
+      Animated.loop(
+        Animated.sequence([
+          Animated.delay(delayMs),
+          Animated.timing(anim, { toValue: 1, duration: 2200, useNativeDriver: true }),
+          Animated.timing(anim, { toValue: 0, duration: 0, useNativeDriver: true }),
+        ]),
+      );
+    const l0 = ringLoop(a0, 0);
+    const l1 = ringLoop(a1, 450);
+    const l2 = ringLoop(a2, 900);
+    l0.start();
+    l1.start();
+    l2.start();
+    return () => {
+      l0.stop();
+      l1.stop();
+      l2.stop();
+    };
+  }, [a0, a1, a2]);
+
+  const ring = (anim) => {
+    const scale = anim.interpolate({ inputRange: [0, 1], outputRange: [1, 2.35] });
+    const opacity = anim.interpolate({
+      inputRange: [0, 0.25, 1],
+      outputRange: [0.45, 0.32, 0],
+    });
+    return (
+      <Animated.View
+        style={[
+          styles.scanRingBase,
+          {
+            transform: [{ scale }],
+            opacity,
+          },
+        ]}
+      />
+    );
+  };
+
+  return (
+    <View style={styles.scanRingWrap}>
+      {ring(a2)}
+      {ring(a1)}
+      {ring(a0)}
+      <MaterialCommunityIcons name="bluetooth" size={52} color="#3898FC" style={styles.scanRingIcon} />
+    </View>
+  );
+}
+
+/** Single faster pulse ring (connecting). */
+function ConnectingPulseRing() {
+  const a = useRef(new Animated.Value(0)).current;
+  useEffect(() => {
+    const loop = Animated.loop(
+      Animated.sequence([
+        Animated.timing(a, { toValue: 1, duration: 750, useNativeDriver: true }),
+        Animated.timing(a, { toValue: 0, duration: 0, useNativeDriver: true }),
+      ]),
+    );
+    loop.start();
+    return () => loop.stop();
+  }, [a]);
+  const scale = a.interpolate({ inputRange: [0, 1], outputRange: [1, 1.75] });
+  const opacity = a.interpolate({
+    inputRange: [0, 0.4, 1],
+    outputRange: [0.5, 0.25, 0],
+  });
+  return (
+    <View style={styles.scanRingWrap}>
+      <Animated.View
+        style={[
+          styles.scanRingBase,
+          { transform: [{ scale }], opacity },
+        ]}
+      />
+      <MaterialCommunityIcons name="bluetooth" size={52} color="#3898FC" style={styles.scanRingIcon} />
+    </View>
+  );
+}
+
+/** Green circle + check; spring approximates a drawn check (no SVG in project). */
+function SuccessCheckmark() {
+  const draw = useRef(new Animated.Value(0)).current;
+  useEffect(() => {
+    draw.setValue(0);
+    Animated.spring(draw, {
+      toValue: 1,
+      friction: 7,
+      tension: 80,
+      useNativeDriver: true,
+    }).start();
+  }, [draw]);
+  const scale = draw.interpolate({ inputRange: [0, 1], outputRange: [0.2, 1] });
+  const opacity = draw;
+  return (
+    <View style={styles.successCheckCircle}>
+      <Animated.View style={{ transform: [{ scale }], opacity }}>
+        <MaterialCommunityIcons name="check-bold" size={46} color="#FFF" />
+      </Animated.View>
+    </View>
+  );
+}
 
 // --- DEVICE SEARCH SCREEN ---
 const DeviceSearchScreen = ({ onClose, onConnected }) => {
-  const [devices, setDevices] = useState([]);
-  const [scanning, setScanning] = useState(true);
-  const [error, setError] = useState(bleNativeModuleError || '');
-  const [connectingId, setConnectingId] = useState(null);
-  const [connectedId, setConnectedId] = useState(null);
-  const [namedOnly, setNamedOnly] = useState(false);
-  const [nameFilter, setNameFilter] = useState('');
+  const [phase, setPhase] = useState(() => (!bleManager ? 'unavailable' : 'scanning'));
+  const [scanEpoch, setScanEpoch] = useState(0);
+  const [foundDevice, setFoundDevice] = useState(null);
 
   useEffect(() => {
-    if (!bleManager) {
-      setScanning(false);
-      return;
-    }
+    if (!bleManager) return;
+    if (phase !== 'scanning') return;
 
     let cancelled = false;
     let timeoutId = null;
 
-    const runScan = async () => {
-      if (Platform.OS === 'android') {
-        const apiLevel = Platform.Version;
-        const perms = [
-          PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
-          ...(apiLevel >= 31
-            ? [
-                PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN,
-                PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT,
-              ]
-            : []),
-        ].filter(Boolean);
-        try {
-          const result = await PermissionsAndroid.requestMultiple(perms);
-          const denied = Object.keys(result).find((k) => result[k] !== PermissionsAndroid.RESULTS.GRANTED);
-          if (denied && !cancelled) {
-            setError('Bluetooth permission is required to find and connect to your wristband.');
-            setScanning(false);
-            return;
-          }
-        } catch (permErr) {
-          if (!cancelled) {
-            setError(permErr?.message || 'Permission request failed.');
-            setScanning(false);
-          }
-          return;
-        }
-      }
-
+    const onScan = (scanError, device) => {
       if (cancelled) return;
-
-      setScanning(true);
-      setError('');
-      const seen = new Set();
-
-      bleManager.startDeviceScan(null, null, (scanError, device) => {
-        if (cancelled) return;
-        if (scanError) {
-          setError(scanError.message || 'Error while scanning for devices.');
-          setScanning(false);
-          return;
-        }
-        if (!device) return;
-        if (seen.has(device.id)) return;
-        seen.add(device.id);
-        const hasName = !!(device.name || device.localName);
-        const displayName = hasName
-          ? (device.name || device.localName)
-          : `Unknown device (${shortDeviceId(device.id)})`;
-        setDevices((prev) => [
-          ...prev,
-          {
-            id: device.id,
-            name: displayName,
-            hasName,
-          },
-        ]);
-      });
-
-      timeoutId = setTimeout(() => {
-        if (!cancelled) {
-          bleManager.stopDeviceScan();
-          setScanning(false);
-        }
-      }, 10000);
+      if (scanError) {
+        Alert.alert('Scan error', scanError.message || 'Could not scan for devices.');
+        return;
+      }
+      if (!device) return;
+      if (!deviceNameMatchesSahey(device)) return;
+      bleManager.stopDeviceScan();
+      const name = device.name || device.localName || 'Sahey Band';
+      const rssi = typeof device.rssi === 'number' ? device.rssi : null;
+      setFoundDevice({ id: device.id, name, rssi });
+      setPhase('found');
     };
 
-    runScan();
+    bleManager.startDeviceScan(null, { allowDuplicates: false }, onScan);
+
+    timeoutId = setTimeout(() => {
+      if (cancelled) return;
+      bleManager.stopDeviceScan();
+      setPhase((p) => (p === 'scanning' ? 'notfound' : p));
+    }, 15000);
 
     return () => {
       cancelled = true;
       bleManager.stopDeviceScan();
       if (timeoutId != null) clearTimeout(timeoutId);
     };
+  }, [phase, scanEpoch]);
+
+  const handleConnectToBand = useCallback(async () => {
+    if (!bleManager || !foundDevice) return;
+    setPhase('connecting');
+    try {
+      const device = await bleManager.connectToDevice(foundDevice.id, { requestMTU: 256 });
+      await device.discoverAllServicesAndCharacteristics();
+      const nm = device.name || device.localName || foundDevice.name || 'Sahey Band';
+      if (onConnected) onConnected(device.id, nm);
+      setFoundDevice((prev) => (prev ? { ...prev, name: nm } : prev));
+      setPhase('success');
+    } catch (e) {
+      Alert.alert('Connection failed', e?.message || 'Could not connect to your Sahey Band.');
+      setPhase('found');
+    }
+  }, [foundDevice, onConnected]);
+
+  const handleNotMyDevice = useCallback(() => {
+    setFoundDevice(null);
+    setPhase('scanning');
+    setScanEpoch((k) => k + 1);
   }, []);
 
-  const handleConnect = async (deviceId) => {
-    if (!bleManager) return;
-    setError('');
-    setConnectingId(deviceId);
-    try {
-      const device = await bleManager.connectToDevice(deviceId, {
-        requestMTU: 256,
-      });
-      await device.discoverAllServicesAndCharacteristics();
-      setConnectedId(deviceId);
-      if (onConnected) {
-        onConnected();
-      }
-    } catch (e) {
-      setError(e.message || 'Could not connect to device.');
-    } finally {
-      setConnectingId(null);
-    }
-  };
+  const handleTryScanAgain = useCallback(() => {
+    setPhase('scanning');
+    setScanEpoch((k) => k + 1);
+  }, []);
+
+  const showBack = phase !== 'connecting' && phase !== 'success';
+
+  if (phase === 'unavailable') {
+    return (
+      <View style={styles.screenInner}>
+        <View style={styles.headerRow}>
+          <TouchableOpacity onPress={onClose} hitSlop={12}>
+            <MaterialCommunityIcons name="chevron-left" size={28} color="#000" />
+          </TouchableOpacity>
+        </View>
+        <View style={styles.scanBody}>
+          <Text style={styles.emptyBody}>{bleNativeModuleError || 'Bluetooth is not available.'}</Text>
+        </View>
+      </View>
+    );
+  }
+
+  const sig = foundDevice ? signalLabel(foundDevice.rssi) : 'Strong signal';
 
   return (
     <View style={styles.screenInner}>
       <View style={styles.headerRow}>
-        <TouchableOpacity onPress={onClose}>
-          <MaterialCommunityIcons name="chevron-left" size={28} color="#000" />
-        </TouchableOpacity>
-      </View>
-
-      <View style={styles.searchHeader}>
-        <Text style={styles.searchTitle}>Searching for devices…</Text>
-        <Text style={styles.searchSubtitle}>
-          Make sure your Bluetooth is enabled and your wristband is on. To see your ESP32 by name, set its BLE name in firmware (e.g. BLEDevice::init("Sahey")).
-        </Text>
-      </View>
-
-      {devices.length > 0 ? (
-        <View style={styles.filterSection}>
-          <TextInput
-            style={styles.nameFilterInput}
-            placeholder="Filter by name (e.g. Sahey or ESP32)"
-            placeholderTextColor="#999"
-            value={nameFilter}
-            onChangeText={setNameFilter}
-            autoCapitalize="none"
-            autoCorrect={false}
-          />
-          <TouchableOpacity
-            style={styles.namedOnlyRow}
-            onPress={() => setNamedOnly((v) => !v)}
-            activeOpacity={0.7}
-          >
-            <Text style={styles.namedOnlyLabel}>Only show named devices</Text>
-            <View style={[styles.checkbox, namedOnly && styles.checkboxChecked]}>
-              {namedOnly ? <MaterialCommunityIcons name="check" size={16} color="#FFF" /> : null}
-            </View>
+        {showBack ? (
+          <TouchableOpacity onPress={onClose} hitSlop={12}>
+            <MaterialCommunityIcons name="chevron-left" size={28} color="#000" />
           </TouchableOpacity>
-        </View>
-      ) : null}
-
-      {error ? (
-        <View style={styles.errorBox}>
-          <Text style={styles.errorText}>{error}</Text>
-        </View>
-      ) : null}
-
-      <View style={{ marginTop: 24 }}>
-        {scanning ? (
-          <View style={styles.searchingRow}>
-            <ActivityIndicator color="#3898FC" />
-            <Text style={styles.searchingText}>Scanning for nearby devices…</Text>
-          </View>
-        ) : !bleManager ? null : devices.length === 0 ? (
-          <Text style={styles.emptyBody}>
-            No devices detected yet. Move closer to your wristband and try again.
-          </Text>
-        ) : null}
+        ) : (
+          <View style={{ width: 28 }} />
+        )}
       </View>
 
-      <FlatList
-        data={(namedOnly ? devices.filter((d) => d.hasName) : devices).filter(
-          (d) => !nameFilter.trim() || d.name.toLowerCase().includes(nameFilter.trim().toLowerCase())
+      <View style={styles.scanBody}>
+        {phase === 'scanning' && (
+          <>
+            <ScanRippleRings />
+            <Text style={styles.scanTitleBlue}>Searching for your wristband…</Text>
+            <Text style={styles.scanSubtitleGrey}>Make sure it&apos;s powered on and nearby.</Text>
+          </>
         )}
-        keyExtractor={(item) => item.id}
-        style={{ marginTop: 24 }}
-        renderItem={({ item }) => {
-          const isConnecting = connectingId === item.id;
-          const isConnected = connectedId === item.id;
-          return (
+
+        {phase === 'notfound' && (
+          <>
+            <View style={styles.notFoundGreyCircle}>
+              <MaterialCommunityIcons name="bluetooth-off" size={44} color="#9CA3AF" />
+            </View>
+            <Text style={styles.notFoundTitle}>Couldn&apos;t find your wristband</Text>
+            <Text style={styles.scanSubtitleGrey}>
+              Make sure your Sahey Band is charged, switched on, and within range.
+            </Text>
             <TouchableOpacity
-              onPress={() => handleConnect(item.id)}
-              disabled={isConnecting}
-              activeOpacity={0.8}
+              style={[styles.wideBlackButton, styles.fullWidthBtn, styles.notFoundTryAgainBtn]}
+              onPress={handleTryScanAgain}
+              activeOpacity={0.85}
             >
-              <View style={styles.deviceCard}>
-                <View>
-                  <Text style={styles.deviceName}>{item.name}</Text>
-                  <Text style={styles.deviceId} numberOfLines={1}>
-                    {item.id}
-                  </Text>
-                </View>
-                <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-                  {isConnected && (
-                    <Text style={styles.connectedBadge}>Connected</Text>
-                  )}
-                  {isConnecting ? (
-                    <ActivityIndicator color="#3898FC" />
-                  ) : (
-                    <MaterialCommunityIcons
-                      name="chevron-right"
-                      size={22}
-                      color="#888"
-                    />
-                  )}
-                </View>
-              </View>
+              <Text style={styles.wideBlackButtonText}>Try again</Text>
             </TouchableOpacity>
-          );
-        }}
-      />
+          </>
+        )}
+
+        {phase === 'found' && foundDevice && (
+          <>
+            <Text style={[styles.searchTitle, styles.foundTitleSpacing]}>Your wristband was found!</Text>
+            <Text style={[styles.scanSubtitleGrey, styles.foundSubtitleSpacing]}>
+              We detected your Sahey device nearby and it&apos;s ready to pair.
+            </Text>
+            <View style={[styles.deviceCard, styles.foundDeviceCard]}>
+              <View style={styles.iconCircle}>
+                <MaterialCommunityIcons name="watch-variant" size={22} color="#3898FC" />
+              </View>
+              <View style={{ flex: 1, marginLeft: 12 }}>
+                <Text style={styles.deviceName}>{foundDevice.name}</Text>
+                <Text style={styles.deviceRssi}>
+                  Ready to connect · {sig}
+                </Text>
+              </View>
+            </View>
+            <TouchableOpacity
+              style={[styles.connectButton, styles.fullWidthBtn, styles.foundContinueButton]}
+              onPress={handleConnectToBand}
+              activeOpacity={0.85}
+            >
+              <Text style={styles.connectButtonTextOnly}>Continue connecting</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[styles.ghostButton, styles.fullWidthBtn, styles.foundGhostButton]}
+              onPress={handleNotMyDevice}
+              activeOpacity={0.75}
+            >
+              <Text style={styles.ghostButtonText}>Not my device</Text>
+            </TouchableOpacity>
+          </>
+        )}
+
+        {phase === 'connecting' && (
+          <>
+            <ConnectingPulseRing />
+            <Text style={styles.searchTitle}>Connecting…</Text>
+            <Text style={styles.scanSubtitleGrey}>
+              Establishing a secure connection to your Sahey Band.
+            </Text>
+          </>
+        )}
+
+        {phase === 'success' && foundDevice && (
+          <>
+            <SuccessCheckmark />
+            <Text style={styles.searchTitle}>Connected!</Text>
+            <Text style={styles.scanSubtitleGrey}>Your wristband is ready to use.</Text>
+            <View style={styles.successSummaryCard}>
+              <View style={styles.iconCircle}>
+                <MaterialCommunityIcons name="watch-variant" size={22} color="#16A34A" />
+              </View>
+              <View style={{ flex: 1, marginLeft: 12 }}>
+                <Text style={styles.successSummaryName}>{foundDevice.name}</Text>
+                <Text style={styles.successSummaryMeta}>Connected · {sig}</Text>
+              </View>
+            </View>
+            <TouchableOpacity
+              style={[styles.wideBlackButton, styles.fullWidthBtn]}
+              onPress={onClose}
+              activeOpacity={0.85}
+            >
+              <Text style={styles.wideBlackButtonText}>Done</Text>
+            </TouchableOpacity>
+          </>
+        )}
+      </View>
     </View>
   );
 };
@@ -729,11 +1964,250 @@ const styles = StyleSheet.create({
   statusBadge: { flexDirection: 'row', alignItems: 'center', marginTop: 5 },
   pulseDot: { width: 8, height: 8, borderRadius: 4, backgroundColor: '#4CAF50', marginRight: 6 },
   pulseDotOff: { backgroundColor: '#CCC' },
+  pulseDotReconnect: { backgroundColor: '#3898FC' },
   statusText: { color: '#666', fontSize: 14 },
   statusTextOff: { color: '#999' },
+  statusTextReconnect: { color: '#3898FC', fontWeight: '600' },
+  homeReconnectingBox: {
+    marginTop: 16,
+    alignItems: 'center',
+    paddingVertical: 8,
+  },
   batteryContainer: { alignItems: 'center' },
   batteryText: { fontSize: 12, fontWeight: 'bold', color: '#4CAF50' },
-  imageContainer: { alignItems: 'center', marginVertical: 40, padding: 30, backgroundColor: '#FBFBFB', borderRadius: 40 },
+  imageContainer: {
+    position: 'relative',
+    alignItems: 'center',
+    marginVertical: 40,
+    padding: 30,
+    backgroundColor: '#FBFBFB',
+    borderRadius: 40,
+  },
+  imageContainerMenuBtn: {
+    position: 'absolute',
+    top: 16,
+    right: 16,
+    padding: 6,
+    zIndex: 2,
+  },
+  connectedPill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    alignSelf: 'center',
+    marginTop: 16,
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 999,
+    backgroundColor: '#F0FDF4',
+  },
+  connectedPillDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    backgroundColor: '#16A34A',
+    marginRight: 8,
+  },
+  connectedPillText: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: '#16A34A',
+  },
+  deviceSheetRoot: {
+    flex: 1,
+    justifyContent: 'flex-end',
+  },
+  deviceSheetBackdropFill: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: 'rgba(0,0,0,0.55)',
+  },
+  deviceSheetPanelWrap: {
+    width: '100%',
+  },
+  deviceSheetPanel: {
+    backgroundColor: '#FFF',
+    borderTopLeftRadius: 24,
+    borderTopRightRadius: 24,
+    paddingHorizontal: 24,
+    paddingTop: 12,
+    paddingBottom: 28,
+  },
+  deviceSheetHandle: {
+    alignSelf: 'center',
+    width: 40,
+    height: 4,
+    borderRadius: 2,
+    backgroundColor: '#DDE1E6',
+    marginBottom: 16,
+  },
+  deviceSheetSectionLabel: {
+    fontSize: 11,
+    fontWeight: '700',
+    letterSpacing: 0.8,
+    color: '#888',
+    marginBottom: 14,
+  },
+  deviceSheetDisconnectCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#FEF2F2',
+    borderRadius: 18,
+    padding: 16,
+    marginBottom: 12,
+  },
+  deviceSheetDisconnectTitle: {
+    flex: 1,
+    marginLeft: 12,
+    fontSize: 16,
+    fontWeight: '800',
+    color: '#B91C1C',
+  },
+  deviceSheetCancelBtn: {
+    paddingVertical: 16,
+    alignItems: 'center',
+    borderRadius: 16,
+    backgroundColor: '#F1F3F5',
+  },
+  deviceSheetCancelText: {
+    fontSize: 16,
+    fontWeight: '700',
+    color: '#333',
+  },
+  scanBody: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingBottom: 24,
+    paddingHorizontal: 8,
+  },
+  scanRingWrap: {
+    width: 220,
+    height: 220,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: 8,
+  },
+  scanRingBase: {
+    position: 'absolute',
+    width: 100,
+    height: 100,
+    borderRadius: 50,
+    borderWidth: 2,
+    borderColor: '#3898FC',
+  },
+  scanRingIcon: {
+    zIndex: 4,
+  },
+  scanTitleBlue: {
+    marginTop: 20,
+    fontSize: 20,
+    fontWeight: '800',
+    color: '#3898FC',
+    textAlign: 'center',
+  },
+  scanSubtitleGrey: {
+    marginTop: 10,
+    fontSize: 15,
+    color: '#888',
+    textAlign: 'center',
+    lineHeight: 22,
+    paddingHorizontal: 8,
+  },
+  foundTitleSpacing: {
+    marginTop: 4,
+    textAlign: 'center',
+  },
+  foundSubtitleSpacing: {
+    marginTop: 8,
+    marginBottom: 4,
+  },
+  foundDeviceCard: {
+    width: '100%',
+    marginTop: 16,
+    marginBottom: 0,
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  foundContinueButton: {
+    marginTop: 22,
+    justifyContent: 'center',
+  },
+  foundGhostButton: {
+    marginTop: 12,
+  },
+  connectButtonTextOnly: {
+    color: '#FFF',
+    fontWeight: '700',
+    fontSize: 16,
+    textAlign: 'center',
+  },
+  homeConnectButton: {
+    marginTop: 20,
+    alignSelf: 'center',
+  },
+  fullWidthBtn: {
+    alignSelf: 'stretch',
+    width: '100%',
+    marginTop: 14,
+    justifyContent: 'center',
+  },
+  ghostButton: {
+    paddingVertical: 14,
+    paddingHorizontal: 24,
+    borderRadius: 999,
+    backgroundColor: 'transparent',
+    borderWidth: 1.5,
+    borderColor: '#E2E5E9',
+    alignItems: 'center',
+  },
+  ghostButtonText: {
+    fontSize: 16,
+    fontWeight: '700',
+    color: '#555',
+  },
+  successCheckCircle: {
+    width: 88,
+    height: 88,
+    borderRadius: 44,
+    backgroundColor: '#22C55E',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: 8,
+  },
+  successSummaryCard: {
+    width: '100%',
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#F0FDF4',
+    padding: 18,
+    borderRadius: 18,
+    marginTop: 20,
+    marginBottom: 8,
+  },
+  successSummaryName: {
+    fontSize: 17,
+    fontWeight: '800',
+    color: '#166534',
+  },
+  successSummaryMeta: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#16A34A',
+    marginTop: 4,
+  },
+  wideBlackButton: {
+    backgroundColor: '#000',
+    flexDirection: 'row',
+    paddingVertical: 18,
+    paddingHorizontal: 24,
+    borderRadius: 20,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  wideBlackButtonText: {
+    color: '#FFF',
+    fontWeight: '800',
+    fontSize: 16,
+  },
   imageLabel: { marginTop: 10, color: '#CCC', fontSize: 11, fontWeight: 'bold' },
   connectInfo: {
     marginTop: 16,
@@ -741,8 +2215,19 @@ const styles = StyleSheet.create({
     color: '#555',
     textAlign: 'center',
   },
-  connectButton: {
+  connectedInfo: {
     marginTop: 16,
+    fontSize: 14,
+    color: '#3898FC',
+    textAlign: 'center',
+    fontWeight: '600',
+  },
+  connectedButtons: {
+    flexDirection: 'row',
+    marginTop: 16,
+    gap: 12,
+  },
+  connectButton: {
     paddingVertical: 12,
     paddingHorizontal: 24,
     borderRadius: 999,
@@ -752,6 +2237,20 @@ const styles = StyleSheet.create({
   },
   connectButtonText: {
     color: '#FFF',
+    fontWeight: '700',
+    fontSize: 16,
+    marginLeft: 8,
+  },
+  disconnectButton: {
+    paddingVertical: 12,
+    paddingHorizontal: 24,
+    borderRadius: 999,
+    backgroundColor: '#FDECEA',
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  disconnectButtonText: {
+    color: '#E53935',
     fontWeight: '700',
     fontSize: 16,
     marginLeft: 8,
@@ -831,6 +2330,27 @@ const styles = StyleSheet.create({
     marginTop: 4,
     maxWidth: 200,
   },
+  deviceRssi: {
+    fontSize: 12,
+    color: '#3898FC',
+    marginTop: 2,
+    fontWeight: '600',
+  },
+  rescanButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginTop: 14,
+    paddingVertical: 10,
+    paddingHorizontal: 16,
+    alignSelf: 'center',
+  },
+  rescanButtonText: {
+    marginLeft: 8,
+    fontSize: 15,
+    fontWeight: '700',
+    color: '#3898FC',
+  },
   searchingRow: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -875,6 +2395,25 @@ const styles = StyleSheet.create({
     fontSize: 20,
     fontWeight: '700',
     color: '#1a1a1a',
+  },
+  notFoundTitle: {
+    marginTop: 8,
+    fontSize: 20,
+    fontWeight: '700',
+    color: '#000',
+    textAlign: 'center',
+  },
+  notFoundGreyCircle: {
+    width: 112,
+    height: 112,
+    borderRadius: 56,
+    backgroundColor: '#E8EAED',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: 8,
+  },
+  notFoundTryAgainBtn: {
+    marginTop: 8,
   },
   searchSubtitle: {
     marginTop: 4,
@@ -1006,5 +2545,397 @@ const styles = StyleSheet.create({
     fontSize: 14,
     color: '#666',
     marginTop: 2,
+  },
+  syncBar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    backgroundColor: '#E8F4FD',
+    paddingVertical: 14,
+    paddingHorizontal: 16,
+    borderRadius: 16,
+    marginTop: 16,
+  },
+  syncBarDisabled: {
+    opacity: 0.7,
+  },
+  syncBarLeft: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  syncBarText: {
+    marginLeft: 10,
+    fontSize: 15,
+    fontWeight: '600',
+    color: '#3898FC',
+  },
+  // --- Contacts sync UI (banner + screens) ---
+  syncBannerNever: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    backgroundColor: '#E8F4FD',
+    borderRadius: 16,
+    borderWidth: 1.5,
+    borderColor: '#BFDBFE',
+    paddingVertical: 14,
+    paddingHorizontal: 16,
+    marginTop: 16,
+  },
+  syncBannerDelta: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    backgroundColor: '#FFFBEB',
+    borderRadius: 16,
+    borderWidth: 1.5,
+    borderColor: '#FDE68A',
+    paddingVertical: 14,
+    paddingHorizontal: 16,
+    marginTop: 16,
+  },
+  syncBannerUpToDate: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    backgroundColor: '#F0FDF4',
+    borderRadius: 16,
+    borderWidth: 1.5,
+    borderColor: '#BBF7D0',
+    paddingVertical: 14,
+    paddingHorizontal: 16,
+    marginTop: 16,
+  },
+  syncBannerLeft: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  syncBannerTitleBlue: {
+    fontSize: 15,
+    fontWeight: '700',
+    color: '#1D4ED8',
+  },
+  syncBannerSubBlue: {
+    marginTop: 3,
+    fontSize: 13,
+    fontWeight: '600',
+    color: '#3B82F6',
+  },
+  syncBannerTitleAmber: {
+    fontSize: 15,
+    fontWeight: '700',
+    color: '#92400E',
+  },
+  syncBannerSubAmber: {
+    marginTop: 3,
+    fontSize: 13,
+    fontWeight: '600',
+    color: '#B45309',
+  },
+  syncBannerTitleGreen: {
+    fontSize: 15,
+    fontWeight: '700',
+    color: '#15803D',
+  },
+  syncBannerSubGreen: {
+    marginTop: 3,
+    fontSize: 13,
+    fontWeight: '600',
+    color: '#16A34A',
+  },
+  // --- Contacts sync preview screen ---
+  syncPreviewHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    justifyContent: 'flex-start',
+  },
+  syncPreviewHeader: {
+    marginTop: 10,
+  },
+  syncPreviewTitle: {
+    fontSize: 22,
+    fontWeight: '900',
+    color: '#000',
+  },
+  syncPreviewSubtitle: {
+    marginTop: 8,
+    fontSize: 14,
+    color: '#666',
+    lineHeight: 20,
+    textAlign: 'left',
+  },
+  syncPreviewCardBase: {
+    backgroundColor: '#F8F9FA',
+    padding: 18,
+    borderRadius: 18,
+    marginBottom: 12,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  syncPreviewCardNew: {
+    backgroundColor: '#F0FDF4',
+  },
+  syncPreviewCardSynced: {
+    backgroundColor: '#F8F9FA',
+  },
+  syncPreviewBadgeWrap: {
+    marginLeft: 12,
+  },
+  syncPreviewBadgeBase: {
+    fontSize: 11,
+    fontWeight: '700',
+    borderRadius: 999,
+    paddingVertical: 3,
+    paddingHorizontal: 8,
+    backgroundColor: '#F0FDF4',
+  },
+  syncPreviewBadgeNewText: {
+    color: '#15803D',
+  },
+  syncPreviewBadgeSyncedText: {
+    color: '#888',
+    backgroundColor: '#F8F9FA',
+  },
+  syncPreviewSectionLabel: {
+    marginTop: 8,
+    fontSize: 12,
+    fontWeight: '800',
+    color: '#888',
+    letterSpacing: 0.7,
+    textTransform: 'uppercase',
+    marginBottom: 8,
+  },
+  syncPreviewCtaBtn: {
+    marginTop: 18,
+    backgroundColor: '#3898FC',
+    borderRadius: 20,
+    padding: 20,
+    alignItems: 'center',
+    justifyContent: 'center',
+    width: '100%',
+  },
+  syncPreviewCtaText: {
+    color: '#FFF',
+    fontWeight: '800',
+    fontSize: 16,
+  },
+  syncPreviewGhostBtn: {
+    marginTop: 12,
+    paddingVertical: 14,
+    alignItems: 'center',
+    borderRadius: 18,
+    backgroundColor: '#F1F3F5',
+    width: '100%',
+  },
+  syncPreviewGhostBtnText: {
+    color: '#333',
+    fontWeight: '700',
+    fontSize: 16,
+  },
+
+  // --- Contacts sync execution screen ---
+  syncExecHeaderRow: {
+    flexDirection: 'row',
+    justifyContent: 'flex-start',
+    alignItems: 'flex-start',
+  },
+  syncExecTop: {
+    alignItems: 'center',
+    marginTop: 8,
+  },
+  syncExecIconCircle: {
+    width: 72,
+    height: 72,
+    borderRadius: 36,
+    backgroundColor: '#E8F4FD',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: 10,
+  },
+  syncExecTitle: {
+    fontSize: 22,
+    fontWeight: '900',
+    color: '#000',
+    textAlign: 'center',
+  },
+  syncExecSubtitle: {
+    marginTop: 6,
+    fontSize: 15,
+    color: '#666',
+  },
+  syncExecProgressBarTrack: {
+    marginTop: 16,
+    height: 6,
+    width: '100%',
+    backgroundColor: '#F1F3F5',
+    borderRadius: 3,
+    overflow: 'hidden',
+  },
+  syncExecProgressBarFill: {
+    height: 6,
+    width: '100%',
+    backgroundColor: '#3898FC',
+    borderRadius: 3,
+  },
+  syncExecProgressLabelRow: {
+    marginTop: 12,
+    width: '100%',
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+  },
+  syncExecStepText: {
+    color: '#3898FC',
+    fontWeight: '700',
+    fontSize: 13,
+  },
+  syncExecPercentText: {
+    color: '#000',
+    fontWeight: '700',
+    fontSize: 13,
+  },
+  syncExecSectionLabel: {
+    fontSize: 12,
+    fontWeight: '800',
+    color: '#888',
+    letterSpacing: 0.7,
+    textTransform: 'uppercase',
+    marginBottom: 8,
+  },
+  syncExecRow: {
+    backgroundColor: '#F8F9FA',
+    padding: 18,
+    borderRadius: 18,
+    marginBottom: 12,
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+  },
+  syncExecRowGrey: {
+    backgroundColor: '#F8F9FA',
+  },
+  syncExecRowFailed: {
+    backgroundColor: '#FDECEA',
+  },
+  syncExecRowName: {
+    fontSize: 16,
+    fontWeight: '800',
+    color: '#1a1a1a',
+    marginBottom: 2,
+  },
+  syncExecRowPhone: {
+    fontSize: 13,
+    color: '#666',
+  },
+  syncExecDashIcon: {
+    color: '#9CA3AF',
+    fontSize: 22,
+    fontWeight: '900',
+    marginLeft: 12,
+  },
+  syncExecIconRight: {
+    marginLeft: 12,
+    minWidth: 24,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  syncExecDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    backgroundColor: '#BDBDBD',
+  },
+  syncExecFailedX: {
+    color: '#E53935',
+    fontSize: 20,
+    fontWeight: '900',
+  },
+  syncExecErrorText: {
+    color: '#E53935',
+    fontSize: 14,
+    lineHeight: 20,
+  },
+  syncExecTryAgainBtn: {
+    width: '100%',
+    backgroundColor: '#3898FC',
+    borderRadius: 20,
+    paddingVertical: 16,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  syncExecTryAgainText: {
+    color: '#FFF',
+    fontWeight: '800',
+    fontSize: 16,
+  },
+  syncExecCancelGhostBtn: {
+    marginTop: 12,
+    width: '100%',
+    backgroundColor: '#F1F3F5',
+    borderRadius: 18,
+    paddingVertical: 14,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  syncExecCancelGhostText: {
+    color: '#333',
+    fontWeight: '700',
+    fontSize: 16,
+  },
+
+  // --- Contacts sync success screen ---
+  syncSuccessTop: {
+    alignItems: 'center',
+    marginTop: 8,
+  },
+  syncSuccessCircle: {
+    width: 80,
+    height: 80,
+    borderRadius: 40,
+    backgroundColor: '#F0FDF4',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: 10,
+  },
+  syncSuccessTitle: {
+    fontSize: 22,
+    fontWeight: '900',
+    color: '#000',
+    textAlign: 'center',
+  },
+  syncSuccessSubtitle: {
+    marginTop: 8,
+    fontSize: 15,
+    color: '#666',
+    textAlign: 'center',
+  },
+  syncSuccessSummaryCard: {
+    width: '100%',
+    backgroundColor: '#F0FDF4',
+    borderRadius: 20,
+    padding: 16,
+    marginTop: 18,
+  },
+  syncSuccessSummaryRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 6,
+  },
+  syncSuccessSummaryName: {
+    fontSize: 15,
+    fontWeight: '800',
+    color: '#15803D',
+  },
+  syncSuccessSummaryPhone: {
+    fontSize: 13,
+    color: '#166534',
+    marginTop: 2,
+  },
+  syncSuccessTimestamp: {
+    marginTop: 12,
+    color: '#999',
+    fontSize: 12,
+    textAlign: 'left',
   },
 });
